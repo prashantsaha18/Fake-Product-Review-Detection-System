@@ -3,31 +3,80 @@ import re
 import json
 import string
 import logging
-import psycopg2
-import psycopg2.extras
-import nltk
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 from pydantic import BaseModel
 from typing import Optional, List
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Download required NLTK data at cold start
-nltk.download("vader_lexicon", quiet=True)
-nltk.download("punkt", quiet=True)
-nltk.download("stopwords", quiet=True)
+# ---------------------------------------------------------------------------
+# Lightweight built-in sentiment analyser (no NLTK required)
+# ---------------------------------------------------------------------------
+
+_POS_WORDS = {
+    "amazing", "awesome", "best", "brilliant", "excellent", "exceptional",
+    "fantastic", "great", "incredible", "love", "loved", "outstanding",
+    "perfect", "phenomenal", "positive", "recommend", "satisfied", "superb",
+    "terrific", "wonderful", "good", "nice", "happy", "pleased", "delighted",
+    "solid", "decent", "fine", "works", "quality", "reliable", "comfortable",
+    "beautiful", "impressive", "enjoy", "enjoyed", "pleased",
+}
+_NEG_WORDS = {
+    "awful", "bad", "broken", "cheap", "defective", "disappointed",
+    "disappointing", "dreadful", "fail", "failed", "garbage", "horrible",
+    "inferior", "junk", "lousy", "poor", "refund", "return", "rubbish",
+    "terrible", "trash", "useless", "waste", "worst", "hate", "hated",
+    "never", "not", "problem", "issues", "issue", "broke", "stopped",
+    "damaged", "missing", "wrong", "slow", "difficult", "annoying",
+}
+
+def _simple_sentiment(text: str, rating: Optional[int] = None):
+    tokens = re.findall(r"[a-z]+", text.lower())
+    pos = sum(1 for t in tokens if t in _POS_WORDS)
+    neg = sum(1 for t in tokens if t in _NEG_WORDS)
+    total = max(pos + neg, 1)
+    score = (pos - neg) / total
+    score = max(-1.0, min(1.0, score))
+
+    if score >= 0.15:
+        sentiment = "positive"
+    elif score <= -0.15:
+        sentiment = "negative"
+    else:
+        sentiment = "neutral"
+
+    mismatch = False
+    if rating is not None:
+        if rating >= 4 and score < 0.0:
+            mismatch = True
+        elif rating <= 2 and score > 0.15:
+            mismatch = True
+        elif rating == 5 and score < 0.1:
+            mismatch = True
+        elif rating == 1 and score > -0.1:
+            mismatch = True
+
+    return sentiment, round(score, 3), mismatch
 
 # ---------------------------------------------------------------------------
-# Training corpus (synthetic — model trains at cold start, ~100ms)
+# Training corpus (synthetic — trains at cold start, ~100 ms)
 # ---------------------------------------------------------------------------
+
 FAKE_REVIEWS = [
     "This product is absolutely amazing! Best purchase ever! Five stars!",
     "WOW!! I can't believe how great this is! AMAZING QUALITY!!",
@@ -136,9 +185,8 @@ DEMO_REVIEWS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Train ML model at module load (fast — synthetic data only)
+# Train ML model at module load
 # ---------------------------------------------------------------------------
-sia = SentimentIntensityAnalyzer()
 
 _texts = FAKE_REVIEWS + REAL_REVIEWS
 _labels = [1] * len(FAKE_REVIEWS) + [0] * len(REAL_REVIEWS)
@@ -156,6 +204,8 @@ logger.info("ML model trained")
 # ---------------------------------------------------------------------------
 
 def get_db():
+    if not HAS_PSYCOPG2:
+        return None
     url = os.environ.get("DATABASE_URL")
     if not url:
         return None
@@ -250,27 +300,6 @@ def extract_nlp_features(text: str):
     }
 
 
-def analyze_sentiment(text: str, rating: Optional[int] = None):
-    scores = sia.polarity_scores(text)
-    compound = scores["compound"]
-    if compound >= 0.5:
-        sentiment, score = "positive", compound
-    elif compound <= -0.5:
-        sentiment, score = "negative", compound
-    else:
-        sentiment, score = "neutral", compound
-
-    mismatch = False
-    if rating is not None:
-        if (rating >= 4 and compound < 0.0) or (rating <= 2 and compound > 0.2):
-            mismatch = True
-        elif rating == 5 and compound < 0.5:
-            mismatch = True
-        elif rating == 1 and compound > -0.3:
-            mismatch = True
-    return sentiment, round(score, 3), mismatch
-
-
 def analyze_behavior(history: Optional[ReviewerHistory], rating: Optional[int], features: dict):
     flags = []
     if history:
@@ -302,7 +331,7 @@ def analyze_behavior(history: Optional[ReviewerHistory], rating: Optional[int], 
 def classify_review(text: str, rating: Optional[int], history: Optional[ReviewerHistory]):
     nlp_prob = float(nlp_model.predict_proba([text])[0][1])
     features = extract_nlp_features(text)
-    sentiment, sentiment_score, mismatch = analyze_sentiment(text, rating)
+    sentiment, sentiment_score, mismatch = _simple_sentiment(text, rating)
     flags = analyze_behavior(history, rating, features)
 
     score = nlp_prob
@@ -338,36 +367,20 @@ def classify_review(text: str, rating: Optional[int], history: Optional[Reviewer
     }
 
 # ---------------------------------------------------------------------------
-# FastAPI app
+# Shared response builders
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Fake Review Detection API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.get("/ml/health")
-@app.get("/api/health")
-def health():
+def _health_response():
     return {"status": "ok", "model": "trained"}
 
 
-@app.post("/ml/analyze")
-@app.post("/api/analyze")
-def analyze_review(req: ReviewRequest):
+def _analyze_response(req: ReviewRequest):
     if not req.review_text or len(req.review_text.strip()) < 3:
+        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="Review text too short")
-
     result = classify_review(req.review_text, req.rating, req.reviewer_history)
     record = {"reviewer_id": req.reviewer_id, "product": req.product,
               "rating": req.rating, "review_text": req.review_text, **result}
-
     conn = get_db()
     saved_id = None
     if conn:
@@ -391,13 +404,10 @@ def analyze_review(req: ReviewRequest):
             logger.warning(f"DB insert error: {e}")
         finally:
             conn.close()
-
     return {**record, "id": saved_id}
 
 
-@app.post("/ml/batch")
-@app.post("/api/batch")
-def analyze_batch(req: BatchReviewRequest):
+def _batch_response(req: BatchReviewRequest):
     results = []
     for r in req.reviews:
         res = classify_review(r.review_text, r.rating, r.reviewer_history)
@@ -406,9 +416,7 @@ def analyze_batch(req: BatchReviewRequest):
     return {"results": results, "total": len(results)}
 
 
-@app.get("/ml/reviews")
-@app.get("/api/reviews")
-def get_reviews(limit: int = 50, offset: int = 0):
+def _reviews_response(limit: int = 50, offset: int = 0):
     conn = get_db()
     if not conn:
         return {"reviews": [], "total": 0}
@@ -428,9 +436,7 @@ def get_reviews(limit: int = 50, offset: int = 0):
         conn.close()
 
 
-@app.get("/ml/stats")
-@app.get("/api/stats")
-def get_stats():
+def _stats_response():
     conn = get_db()
     if not conn:
         return {"total_analyzed": 0, "fake_count": 0, "real_count": 0,
@@ -452,14 +458,12 @@ def get_stats():
         cur.execute("SELECT behavioral_flags FROM analyzed_reviews WHERE behavioral_flags != '[]'::jsonb")
         flag_rows = cur.fetchall()
         cur.close()
-
         flag_counts = {}
         for fr in flag_rows:
             for f in (fr["behavioral_flags"] or []):
                 flag_counts[f] = flag_counts.get(f, 0) + 1
         top_flags = [{"flag": f, "count": c} for f, c in
                      sorted(flag_counts.items(), key=lambda x: -x[1])[:5]]
-
         total = int(row["total"] or 0)
         fake = int(row["fake_count"] or 0)
         return {
@@ -474,14 +478,14 @@ def get_stats():
     except Exception as e:
         logger.warning(f"Stats error: {e}")
         return {"total_analyzed": 0, "fake_count": 0, "real_count": 0,
-                "fake_rate": 0, "avg_fake_score": 0}
+                "fake_rate": 0, "avg_fake_score": 0,
+                "sentiment_breakdown": {"positive": 0, "negative": 0, "neutral": 0},
+                "top_flags": []}
     finally:
         conn.close()
 
 
-@app.get("/ml/demo")
-@app.get("/api/demo")
-def get_demo():
+def _demo_response():
     results = []
     for r in DEMO_REVIEWS:
         history = ReviewerHistory(**r["reviewer_history"]) if "reviewer_history" in r else None
@@ -489,6 +493,68 @@ def get_demo():
         results.append({**r, **res})
     return {"reviews": results}
 
+# ---------------------------------------------------------------------------
+# FastAPI app — routes registered at BOTH /ml/* and bare /* paths
+# ---------------------------------------------------------------------------
 
+app = FastAPI(title="Fake Review Detection API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Health
+@app.get("/health")
+@app.get("/ml/health")
+@app.get("/api/health")
+def health():
+    return _health_response()
+
+# Analyze
+@app.post("/analyze")
+@app.post("/ml/analyze")
+@app.post("/api/analyze")
+def analyze_review(req: ReviewRequest):
+    return _analyze_response(req)
+
+# Batch
+@app.post("/batch")
+@app.post("/ml/batch")
+@app.post("/api/batch")
+def analyze_batch(req: BatchReviewRequest):
+    return _batch_response(req)
+
+# Reviews
+@app.get("/reviews")
+@app.get("/ml/reviews")
+@app.get("/api/reviews")
+def get_reviews(limit: int = 50, offset: int = 0):
+    return _reviews_response(limit, offset)
+
+# Stats
+@app.get("/stats")
+@app.get("/ml/stats")
+@app.get("/api/stats")
+def get_stats():
+    return _stats_response()
+
+# Demo
+@app.get("/demo")
+@app.get("/ml/demo")
+@app.get("/api/demo")
+def get_demo():
+    return _demo_response()
+
+# ---------------------------------------------------------------------------
 # Vercel ASGI handler
+# ---------------------------------------------------------------------------
 handler = Mangum(app, lifespan="off")
+
+# Local dev entry point
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8090)))
