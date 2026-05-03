@@ -1,6 +1,7 @@
 {
-  "buildCommand": "pnpm install --frozen-lockfile=false && pnpm --filter @workspace/review-detector run build",
-  "outputDirectory": "public",
+  "buildCommand": "pnpm --filter @workspace/review-detector run build",
+  "outputDirectory": "artifacts/review-detector/dist/public",
+  "installCommand": "pnpm install --frozen-lockfile=false",
   "framework": null,
   "functions": {
     "api/index.py": {
