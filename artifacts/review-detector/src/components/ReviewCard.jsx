@@ -16,9 +16,10 @@ export function ReviewCard({ data, delay = 0 }) {
     sentiment_mismatch,
     behavioral_flags = [],
     nlp_features = {},
-    review_text,
     rating
   } = data;
+
+  const review_text = data.review_text || data.text;
 
   return (
     <motion.div 
