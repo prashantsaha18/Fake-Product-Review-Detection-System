@@ -36,7 +36,7 @@ paths = ["/ml"]
 localPort = 8090
 
 [services.development]
-run = "bash artifacts/review-api/start.sh"
+run = "/home/runner/workspace/.pythonlibs/bin/python /home/runner/workspace/artifacts/review-api/main.py"
 
 [services.env]
 PORT = "8090"
