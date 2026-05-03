@@ -436,13 +436,41 @@ def _reviews_response(limit: int = 50, offset: int = 0):
         conn.close()
 
 
+def _demo_stats():
+    """Compute stats from demo reviews — used as fallback when DB is absent/empty."""
+    analyzed = []
+    for r in DEMO_REVIEWS:
+        history = ReviewerHistory(**r["reviewer_history"]) if "reviewer_history" in r else None
+        res = classify_review(r["text"], r["rating"], history)
+        analyzed.append({**r, **res})
+    total = len(analyzed)
+    fake = sum(1 for a in analyzed if a.get("is_fake"))
+    sentiment_breakdown = {"positive": 0, "negative": 0, "neutral": 0}
+    flag_counts: dict = {}
+    scores = []
+    for a in analyzed:
+        s = a.get("sentiment", "neutral")
+        if s in sentiment_breakdown:
+            sentiment_breakdown[s] += 1
+        scores.append(a.get("fake_score", 0))
+        for f in (a.get("behavioral_flags") or []):
+            flag_counts[f] = flag_counts.get(f, 0) + 1
+    top_flags = [{"flag": f, "count": c} for f, c in
+                 sorted(flag_counts.items(), key=lambda x: -x[1])[:5]]
+    return {
+        "total_analyzed": total, "fake_count": fake, "real_count": total - fake,
+        "fake_rate": round(fake / total, 3) if total > 0 else 0,
+        "avg_fake_score": round(sum(scores) / len(scores), 3) if scores else 0,
+        "sentiment_breakdown": sentiment_breakdown,
+        "top_flags": top_flags,
+        "source": "demo",
+    }
+
+
 def _stats_response():
     conn = get_db()
     if not conn:
-        return {"total_analyzed": 0, "fake_count": 0, "real_count": 0,
-                "fake_rate": 0, "avg_fake_score": 0,
-                "sentiment_breakdown": {"positive": 0, "negative": 0, "neutral": 0},
-                "top_flags": []}
+        return _demo_stats()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
@@ -455,6 +483,10 @@ def _stats_response():
             FROM analyzed_reviews
         """)
         row = dict(cur.fetchone())
+        total = int(row["total"] or 0)
+        if total == 0:
+            cur.close()
+            return _demo_stats()
         cur.execute("SELECT behavioral_flags FROM analyzed_reviews WHERE behavioral_flags != '[]'::jsonb")
         flag_rows = cur.fetchall()
         cur.close()
@@ -464,7 +496,6 @@ def _stats_response():
                 flag_counts[f] = flag_counts.get(f, 0) + 1
         top_flags = [{"flag": f, "count": c} for f, c in
                      sorted(flag_counts.items(), key=lambda x: -x[1])[:5]]
-        total = int(row["total"] or 0)
         fake = int(row["fake_count"] or 0)
         return {
             "total_analyzed": total, "fake_count": fake, "real_count": total - fake,
@@ -477,10 +508,7 @@ def _stats_response():
         }
     except Exception as e:
         logger.warning(f"Stats error: {e}")
-        return {"total_analyzed": 0, "fake_count": 0, "real_count": 0,
-                "fake_rate": 0, "avg_fake_score": 0,
-                "sentiment_breakdown": {"positive": 0, "negative": 0, "neutral": 0},
-                "top_flags": []}
+        return _demo_stats()
     finally:
         conn.close()
 
