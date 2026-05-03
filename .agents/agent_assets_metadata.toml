@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "2Hn01opxCnMd8dwGKOe2g"
+uri = "file://fake-review-detector.zip"
+type = "unspecified"
+title = "fake-review-detector.zip"
